@@ -1,1 +1,814 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include "time.h"
+#include <math.h>
+#include <DHT.h>
+
+
+// ---------------- WIFI ----------------
+const char* ssid = "#REDACTED";
+const char* password = "#REDACTED";
+
+// ---------------- PUMP ----------------
+const int pumpPin = 32;
+bool pumpState = false;
+
+// Auto-pump master toggle (user can enable/disable automatic schedule)
+bool autoPumpEnabled = true; // default ON
+
+// ---------------- Ultrasonic ----------------
+#define TRIG_PIN 14
+#define ECHO_PIN 12
+long duration;
+float distance;
+
+// ---------- Temperature ----------
+#define DHTPIN 25
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// ---------- Air Quality ----------
+#define MQ135_PIN 33
+
+// Adjust these after observing your sensor in clean air
+#define AIR_CLEAN  400    // baseline clean air value
+#define AIR_BAD    2000   // very polluted air value
+
+// Sensor timing
+unsigned long lastSensorMillis = 0;
+const unsigned long sensorInterval = 15UL * 60UL * 1000UL;
+
+// Auto schedule control
+bool autoPumpActive = false;
+unsigned long pumpStartMillis = 0;
+unsigned long pumpRunDuration = 60000;
+int lastTriggerMinute = -1;
+
+// Pump schedule times
+const int schedule1Hour = 7;
+const int schedule2Hour = 17;
+
+// ---------------- WEATHER API ----------------
+const char* weatherUrl =
+"https://api.openweathermap.org/data/2.5/weather?lat=#REDACTED&lon=#REDACTED&appid=#REDACTED";
+
+WebServer server(80);
+
+// Weather data
+String weatherMain = "Loading...";
+int lastWeatherFetchHour = -1;
+
+// Sensor values (from DHT & MQ135)
+float tempC = 0.0;       // temperature from DHT
+int humiditySensor = 0;  // humidity from DHT (integer for easier JSON)
+int mq135_raw = 0;       // raw ADC from MQ135
+int airIndex = 0;        // 0 - 100 %
+String airQuality = "UNKNOWN"; // GOOD / MODERATE / BAD / VERY BAD
+
+// Info values
+float windSpeed = 0.0;
+
+//Pump duration info text
+String getPumpInfoText() {
+  if (tempC > 35.0) {
+    return "2L, suhu > 35°C";
+  }
+  return "1L, suhu < 35°C";
+}
+
+// ---------------- TIME (NTP) ----------------
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 8 * 3600;
+const int daylightOffset_sec = 0;
+
+// ---------------- WEATHER MAPPING ----------------
+String mapWeatherBM(String main) {
+  if (main == "Clear") return "Cerah";
+  if (main == "Clouds") return "Berawan";
+  if (main == "Rain") return "Hujan";
+  if (main == "Drizzle") return "Hujan Renyai";
+  if (main == "Thunderstorm") return "Ribut Petir";
+  if (main == "Mist" || main == "Fog") return "Berkabus";
+  if (main == "Haze") return "Jerebu";
+  return main;
+}
+
+// ---------------- WEATHER FETCH ----------------
+void updateWeather() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin(weatherUrl);
+  int httpCode = http.GET();
+
+  if (httpCode == 200) {
+    String payload = http.getString();
+    StaticJsonDocument<2048> doc;
+    DeserializationError err = deserializeJson(doc, payload);
+
+    if (!err) {
+      // main weather
+      String weatherEN = doc["weather"][0]["main"].as<String>();
+      weatherMain = mapWeatherBM(weatherEN);
+
+      // wind speed (m/s)
+      double ws = doc["wind"]["speed"] | 0.0;
+      windSpeed = (float)ws;
+
+      Serial.println("🌦 Weather updated: " + weatherMain);
+      Serial.printf("  Kelajuan angin: %.2f m/s\n", windSpeed);
+    } else {
+      Serial.println("JSON parse error in updateWeather()");
+    }
+  } else {
+    Serial.printf("HTTP error: %d\n", httpCode);
+  }
+  http.end();
+}
+
+// ---------------- TIME STRING ----------------
+String getTimeString() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "Time error";
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buf);
+}
+
+// ---------------- NEXT PUMP TIME ----------------
+String getNextPumpTime() {
+  if (!autoPumpEnabled) return "-----"; // show dashes when auto disabled
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "--:--";
+
+  int h = timeinfo.tm_hour;
+  int nextHour;
+
+  if (h < schedule1Hour) nextHour = schedule1Hour;
+  else if (h < schedule2Hour) nextHour = schedule2Hour;
+  else nextHour = schedule1Hour; // next day
+
+  char buf[6];
+  sprintf(buf, "%02d:00", nextHour);
+  return String(buf);
+}
+
+// ---------------- AUTO PUMP ----------------
+void handleAutoPumpSchedule() {
+  // Respect user master switch
+  if (!autoPumpEnabled) {
+    // reset guard so schedule can trigger correctly after re-enable
+    lastTriggerMinute = -1;
+    return;
+  }
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return;
+
+  int h = timeinfo.tm_hour;
+  int m = timeinfo.tm_min;
+
+  if ((h == schedule1Hour || h == schedule2Hour) && m == 0) {
+    if (lastTriggerMinute != m) {
+
+      // Decide duration based on current temperature
+      if (tempC > 35.0) {
+        pumpRunDuration = 120000; // 2 minutes
+        Serial.println("🔥 High temperature detected (>35°C), pump for 2 minutes");
+      } else {
+        pumpRunDuration = 60000;  // default 1 minute
+        Serial.println("🌤 Normal temperature, pump for 1 minute");
+      }
+
+      pumpState = true;
+      autoPumpActive = true;
+      pumpStartMillis = millis();
+      digitalWrite(pumpPin, HIGH);
+      lastTriggerMinute = m;
+      Serial.println("⏰ Auto pump ON");
+    }
+  }
+
+  if (autoPumpActive && millis() - pumpStartMillis >= pumpRunDuration) {
+    pumpState = false;
+    autoPumpActive = false;
+    digitalWrite(pumpPin, LOW);
+    Serial.println("⏹ Auto pump OFF");
+  }
+
+  if (m != lastTriggerMinute) lastTriggerMinute = -1;
+}
+
+// ---------------- WEATHER SCHEDULE ----------------
+void handleWeatherSchedule() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return;
+
+  int hour = timeinfo.tm_hour;
+  int minute = timeinfo.tm_min;
+
+  // trigger at top of the hour and only once per hour
+  if (minute == 0 && hour != lastWeatherFetchHour) {
+    updateWeather();
+    lastWeatherFetchHour = hour;
+    Serial.printf("Scheduled hourly weather fetch at %02d:00\n", hour);
+  }
+}
+
+// ------------------- SENSOR UPDATE ----------------
+void updateSensors() {
+  mq135_raw = analogRead(MQ135_PIN);
+
+  airIndex = map(mq135_raw, AIR_CLEAN, AIR_BAD, 0, 100);
+  airIndex = constrain(airIndex, 0, 100);
+
+  if (airIndex <= 50) {
+  airQuality = "GOOD";
+}
+else if (airIndex >= 51 && airIndex <= 100) {
+  airQuality = "MODERATE";
+}
+else if (airIndex >= 101 && airIndex <= 300) {
+  airQuality = "BAD";
+}
+else {
+  airQuality = "VERY BAD";
+}
+
+
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  if (!isnan(h) && !isnan(t)) {
+    humiditySensor = (int)h;
+    tempC = t;
+  }
+}
+
+
+// ---------------- INFO ENDPOINT ----------------
+void handleInfo() {
+  // Build a small JSON payload containing sensor-based temp/humidity + wind + air info
+  char buf[256];
+  // temp -> 1 decimal, humidity int, wind 2 decimals
+  snprintf(buf, sizeof(buf),
+           "{\"temp\":%.1f,\"humidity\":%d,\"wind\":%.2f,\"airIndex\":%d,\"airQuality\":\"%s\"}",
+           tempC, humiditySensor, windSpeed, airIndex, airQuality.c_str());
+  server.send(200, "application/json; charset=utf-8", String(buf));
+}
+
+// ---------------- Ultrasonic sensor control ----------------
+long readOnce() {
+  // Ensure clean trigger
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(5);
+
+  // JSN-SR04T likes a slightly longer trigger
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(20);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Read echo with timeout (40ms ≈ ~6.8m max)
+  long duration = pulseIn(ECHO_PIN, HIGH, 40000);
+
+  if (duration == 0) return -1; // no echo
+
+  return duration;
+}
+
+float getDistanceCM() {
+  const int samples = 5;
+  long vals[samples];
+  int count = 0;
+
+  for (int i = 0; i < samples; i++) {
+    long d = readOnce();
+    if (d > 0) {
+      vals[count++] = d;
+    }
+    delay(50);
+  }
+
+  if (count == 0) return -1;
+
+  // Simple average (or we can do median if you want)
+  long sum = 0;
+  for (int i = 0; i < count; i++) sum += vals[i];
+  long avg = sum / count;
+
+  // Speed of sound ≈ 343 m/s = 0.0343 cm/us
+  float distance = (avg * 0.0343) / 2.0;
+  return distance;
+}
+
+//------------------ TANK STATUS ----------------
+
+String getTankStatus() {
+  float d = getDistanceCM();
+
+  if (d < 0) return "Error";
+
+  if (d <= 15) {
+    return "Full";
+  } 
+  else if (d >= 16 && d <= 29) {
+    return "50%";
+  } 
+  else {
+    return "Empty";
+  }
+}
+
+// ---------------- WEB PAGE ----------------
+String webpage() {
+  String nextPump = getNextPumpTime();
+
+  return R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>ESP32 Smart Irrigation</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@500&display=swap');
+
+    body {
+      font-family: 'Orbitron', sans-serif;
+      background: linear-gradient(135deg, #0f172a, #1e293b);
+      color: white;
+      padding: 20px;
+      margin: 0;
+    }
+
+    .card {
+      background: rgba(30, 41, 59, 0.9);
+      border-radius: 20px;
+      padding: 25px;
+      margin-bottom: 20px;
+      box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+      transition: transform 0.3s, box-shadow 0.3s;
+    }
+
+    .card:hover {
+      transform: translateY(-5px);
+      box-shadow: 0 25px 50px rgba(0,0,0,0.6);
+    }
+
+    .weather {
+      font-size: 42px;
+      font-weight: bold;
+      text-align: center;
+      margin: 10px 0;
+    }
+
+    .weather-icon {
+      font-size: 50px;
+      display: block;
+      text-align: center;
+      margin-bottom: 5px;
+    }
+
+    .time {
+      font-size: 20px;
+      text-align: center;
+      opacity: 0.9;
+      margin-bottom: 5px;
+    }
+
+    .label {
+      opacity: 0.7;
+      font-size: 14px;
+      text-align: center;
+    }
+
+    .nextPump {
+      font-size: 18px;
+      opacity: 0.8;
+      text-align: center;
+      margin-top: 5px;
+    }
+
+    .info-list {
+      display: flex;
+      justify-content: center;   
+      gap: 20px;                 
+      margin-top: 12px;
+    }
+
+    .info-list2 {
+      display: flex;
+      justify-content: center;   
+      gap: 20px;                 
+      margin-top: 12px;
+    }
+    .info-item {
+      text-align: center;
+      background: rgba(255,255,255,0.03);
+      padding: 10px 16px;
+      border-radius: 10px;
+      min-width: 120px;
+    }
+    .info-title { font-size: 12px; opacity: 0.7; }
+    .info-value { font-size: 18px; font-weight: bold; margin-top:6px; }
+
+    /* Toggle switch */
+    .switch {
+      position: relative;
+      display: block;
+      width: 60px;
+      height: 34px;
+      margin: 20px auto;
+    }
+
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: #ccc;
+      transition: 0.4s;
+      border-radius: 34px;
+    }
+
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 26px;
+      width: 26px;
+      left: 4px;
+      bottom: 4px;
+      background-color: white;
+      transition: 0.4s;
+      border-radius: 50%;
+    }
+
+    input:checked + .slider {
+      background-color: #22c55e;
+    }
+
+    input:checked + .slider:before {
+      transform: translateX(26px);
+    }
+
+    .auto-row {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 2px;          
+}
+
+.inline-switch {
+  margin: 0 !important;   /* remove big spacing */
+  transform: scale(0.6);  /* smaller size */
+}
+
+/* Air Quality colors */
+.status-good {
+  color: #22c55e;   /* green */
+}
+
+.status-moderate {
+  color: #eab308;   /* yellow */
+}
+
+.status-bad {
+  color: #ef4444;   /* red */
+}
+
+
+
+    .status-full { color: #22c55e; }   /* green */
+    .status-half { color: #eab308; }   /* yellow */
+    .status-empty { color: #ef4444; }  /* red */
+
+  </style>
+</head>
+
+<body>
+
+  <div class="card">
+    <div class="label">Cuaca Sekarang</div>
+    <div class="weather-icon" id="weatherIcon">❓</div>
+    <div class="weather" id="weather">Loading...</div>
+    <div class="time" id="time">Loading...</div>
+
+    <div class="nextPump auto-row">
+      <!-- NEW: Auto-pump status + small toggle -->
+      Status auto-pump: <span id="autoStatus" style="font-weight:bold;">--</span>
+      
+      <label class="switch inline-switch" style="transform:scale(0.5); margin-top:8px;">
+        <input type="checkbox" id="autoToggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <div class="nextPump" style="margin-top:12px;">
+      Waktu Siram Seterusnya: <span id="nextPump">)rawliteral" + nextPump + R"rawliteral(</span>
+    </div>
+    <div class="nextPump">
+      Jumlah air: <span id="pumpInfo" style="font-size:14px; opacity:0.75;"></span>
+    </div>
+
+  </div>
+
+  <!-- New Info card -->
+  <div class="card">
+    <div class="label">Info</div>
+    <div class="info-list">
+      <div class="info-item">
+        <div class="info-title">Suhu</div>
+        <div class="info-value" id="suhu">-- °C</div>
+      </div>
+      <div class="info-item">
+        <div class="info-title">Kelembapan</div>
+        <div class="info-value" id="kelembapan">-- %</div>
+      </div>
+    </div>
+    <div class="info-list2">
+      <div class="info-item">
+        <div class="info-title">Kelajuan Angin</div>
+        <div class="info-value" id="kelajuan">-- m/s</div>
+      </div>
+      <div class="info-item">
+        <div class="info-title">Index Udara</div>
+        <div class="info-value" id="QualityUdara">-- %</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label">Info Tangki</div>
+      <div class="info-list2">
+      <div class="info-item">
+        <div class="info-title">Jumlah Air dalam tangki (5.5L)</div>
+        <div class="info-value" id="Isipadu">-- </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label">Butang Kontrol Pam</div>
+    <label class="switch">
+      <input type="checkbox" id="pumpToggle">
+      <span class="slider"></span>
+    </label>
+  </div>
+
+  <script>
+    const toggle = document.getElementById("pumpToggle");
+    const weather = document.getElementById("weather");
+    const weatherIcon = document.getElementById("weatherIcon");
+    const timeElem = document.getElementById("time");
+    const autoToggle = document.getElementById("autoToggle");
+    const autoStatus = document.getElementById("autoStatus");
+
+    function loadWeather() {
+      fetch('/weather')
+        .then(r => r.text())
+        .then(t => {
+          weather.innerText = t;
+          weatherIcon.innerText = getIconForWeather(t);
+        });
+    }
+
+    function loadTime() {
+      fetch('/time')
+        .then(r => r.text())
+        .then(t => timeElem.innerText = t);
+    }
+
+    function loadNextPump() {
+      fetch('/nextPump')
+        .then(r => r.text())
+        .then(t => document.getElementById('nextPump').innerText = t);
+    }
+
+    function loadInfo() {
+      fetch('/info')
+        .then(r => r.json())
+        .then(j => {
+          document.getElementById('suhu').innerText = (j.temp !== undefined ? j.temp.toFixed(1) : '--') + ' °C';
+          document.getElementById('kelembapan').innerText = (j.humidity !== undefined ? j.humidity : '--') + ' %';
+          document.getElementById('kelajuan').innerText = (j.wind !== undefined ? j.wind.toFixed(2) : '--') + ' m/s';
+
+        const idxEl = document.getElementById('QualityUdara');
+          const idxText = (j.airIndex !== undefined ? j.airIndex : '--') + (j.airQuality ? (' % (' + j.airQuality + ')') : '');
+          idxEl.innerText = idxText;
+
+          // color coding
+          idxEl.classList.remove('status-good','status-moderate','status-bad');
+          if (j.airQuality === 'GOOD') {
+            idxEl.classList.add('status-good');
+          } else if (j.airQuality === 'MODERATE') {
+            idxEl.classList.add('status-moderate');
+          } else {
+            idxEl.classList.add('status-bad');
+          }
+        })
+        .catch(err => {
+          console.warn('Info fetch error', err);
+        });
+    }
+
+    function loadPump() {
+      fetch('/pump/state')
+        .then(r => r.text())
+        .then(state => {
+          toggle.checked = (state === 'ON');
+        });
+    }
+
+    function loadPumpInfo() {
+      fetch('/pump/info')
+        .then(r => r.text())
+        .then(t => {
+          document.getElementById('pumpInfo').innerText = t;
+        });
+    }
+
+    function loadWaterLevel() {
+      fetch('/tank')
+        .then(r => r.text())
+        .then(t => {
+          const el = document.getElementById('Isipadu');
+          el.innerText = t;
+
+          // reset classes
+          el.classList.remove('status-full', 'status-half', 'status-empty');
+
+          if (t === 'Full') {
+            el.classList.add('status-full');
+          } else if (t === '50%') {
+            el.classList.add('status-half');
+          } else if (t === 'Empty') {
+            el.classList.add('status-empty');
+          }
+        });
+    }
+
+    // Auto-pump state load + toggle
+    function loadAutoPump() {
+      fetch('/autopump/state')
+        .then(r => r.text())
+        .then(state => {
+          const on = (state === 'ON');
+          autoToggle.checked = on;
+          autoStatus.innerText = on ? 'Active' : 'Disabled';
+          autoStatus.style.color = on ? '#22c55e' : '#ef4444';
+        })
+        .catch(err => {
+          console.warn('autopump state error', err);
+        });
+    }
+
+    autoToggle.addEventListener('change', () => {
+  fetch('/autopump/toggle')
+    .then(() => {
+      loadAutoPump();
+      loadNextPump();
+    });
+});
+
+
+    toggle.addEventListener('change', () => {
+      fetch('/pump/toggle').then(loadPump);
+    });
+
+    function getIconForWeather(weather) {
+      switch (weather) {
+        case 'Cerah': return '☀️';
+        case 'Berawan': return '☁️';
+        case 'Hujan': return '🌧️';
+        case 'Hujan Renyai': return '🌦️';
+        case 'Ribut Petir': return '⚡';
+        case 'Berkabus': return '🌫️';
+        case 'Jerebu': return '🌫️';
+        default: return '❓';
+      }
+    }
+
+    // initial loads
+    loadWeather();
+    loadTime();
+    loadPump();
+    loadNextPump();
+    loadInfo();
+    loadWaterLevel();
+    loadPumpInfo();
+    loadAutoPump();
+
+    // intervals
+    setInterval(loadWeather, 60000);
+    setInterval(loadTime, 1000);
+    setInterval(loadPump, 5000);
+    setInterval(loadNextPump, 60000);
+    setInterval(loadInfo, 60000);
+    setInterval(loadWaterLevel, 3600000);
+    setInterval(loadPumpInfo, 60000);
+    setInterval(loadAutoPump, 5000);
+  </script>
+
+</body>
+</html>
+)rawliteral";
+}
+
+// ---------------- ROUTES ----------------
+void handleRoot(){ server.send(200,"text/html; charset=utf-8",webpage()); }
+void handleWeather(){ server.send(200,"text/plain; charset=utf-8",weatherMain); }
+void handleTime(){ server.send(200,"text/plain; charset=utf-8",getTimeString()); }
+void handleNextPump(){ server.send(200,"text/plain; charset=utf-8",getNextPumpTime()); }
+void handleWaterLevel() {
+  String status = getTankStatus();
+  server.send(200, "text/plain; charset=utf-8", status);
+}
+void handlePumpInfo() {
+  server.send(200, "text/plain; charset=utf-8", getPumpInfoText());
+}
+
+void handlePumpToggle(){
+  pumpState = !pumpState;
+  digitalWrite(pumpPin, pumpState ? HIGH : LOW);
+  server.send(200,"text/plain; charset=utf-8", pumpState ? "ON" : "OFF");
+}
+void handlePumpState(){ server.send(200,"text/plain; charset=utf-8", pumpState ? "ON" : "OFF"); }
+
+// ---------------- AUTOPUMP ROUTES ----------------
+void handleAutoPumpToggle() {
+  autoPumpEnabled = !autoPumpEnabled;
+  // reset last trigger guard when toggling (so schedule triggers cleanly after re-enable)
+  if (!autoPumpEnabled) lastTriggerMinute = -1;
+  server.send(200, "text/plain; charset=utf-8", autoPumpEnabled ? "ON" : "OFF");
+}
+void handleAutoPumpState() {
+  server.send(200, "text/plain; charset=utf-8", autoPumpEnabled ? "ON" : "OFF");
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+  pinMode(pumpPin,OUTPUT);
+  digitalWrite(pumpPin,LOW);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  WiFi.begin(ssid,password);
+  while(WiFi.status()!=WL_CONNECTED){ delay(500); Serial.print("."); }
+
+  Serial.println("\nWiFi connected");
+  Serial.println(WiFi.localIP());
+
+  configTime(gmtOffset_sec,daylightOffset_sec,ntpServer);
+  updateWeather(); // boot fetch
+
+  server.on("/",handleRoot);
+  server.on("/weather",handleWeather);
+  server.on("/time",handleTime);
+  server.on("/nextPump",handleNextPump);
+  server.on("/info", handleInfo);
+  server.on("/pump/toggle",handlePumpToggle);
+  server.on("/pump/state",handlePumpState);
+  server.on("/tank",handleWaterLevel);
+  server.on("/pump/info", handlePumpInfo);
+
+  // autopump endpoints
+  server.on("/autopump/toggle", handleAutoPumpToggle);
+  server.on("/autopump/state", handleAutoPumpState);
+
+   dht.begin();
+  analogReadResolution(12);
+  updateSensors(); 
+
+  server.begin();
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+  server.handleClient();
+  handleAutoPumpSchedule();
+  handleWeatherSchedule();
+
+    // periodic sensor update
+  if (millis() - lastSensorMillis >= sensorInterval) {
+    lastSensorMillis = millis();
+    updateSensors();
+}
+
+ float distance = getDistanceCM();
+
+  Serial.print("Distance: ");
+  Serial.print(distance);
+  Serial.println(" cm");
+}
 
